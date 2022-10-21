@@ -1,0 +1,280 @@
+---
+title: "Interactive effects of body size and resource availability on hydra life history traits"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+Check the effect of size manipulation:
+```{r}
+#remotes::install_github("glmmTMB/glmmTMB/glmmTMB")
+library(readxl); library(ggplot2); library(EnvStats); library(glmmTMB); library(lme4); library(DHARMa); library(dplyr); library(car); library(emmeans); library(bbmle); library(ggpubr); library(scales)
+
+smdata <- as.data.frame(read_excel("TM2.xlsx"))
+smdata$Strain<-gsub("_","/",smdata$Strain)
+
+smdata<-smdata[-which(smdata$Fate=="sexchange"),]
+smdata<-smdata[-which(smdata$Fate=="hermaphrodite"),]
+smdata<-smdata[-which(smdata$Fate=="failed"),]
+
+smdata$Exp_group_1<-gsub("ctrl", "control",smdata$Exp_group_1)
+smdata$SMgroup<-factor(gsub("[1|2]","",smdata$Exp_group_1), levels=c("reduced","control","enlarged"))
+
+smdata$PairID <- paste(smdata$Strain, smdata$Set_ID, smdata$Exp_group_2, 
+        ifelse(grepl("enlarged|reduced",smdata$SMgroup), "ER", "CC"),
+        smdata$Pair, sep="-")
+
+smdata$Size<-smdata$post_area / (smdata$post_stdmm^2) # size after size manipulation
+
+p<-ggplot(smdata, aes(y=Size, x=SMgroup,fill=SMgroup))+geom_boxplot()+
+    facet_wrap(~Sex*Strain)+stat_n_text()+
+  xlab("Size manipulation group")+
+  ylab(bquote("Body size " (~mm^2)))+
+  guides(fill=guide_legend(title="Size manipulation group:",
+                           title.position="left",
+                           title.hjust=1.0))
+
+# Testing the effect of size manipulation on final (pre-cooling) body size.
+m00.full<-glmmTMB(Size ~ SMgroup + (1|Strain) + (1|PairID), smdata, family="gaussian",dispformula = ~SMgroup)
+plot(simulateResiduals(m00.full, n=1000)) # model disagnostics OK
+m00.red1<-glmmTMB(Size ~ 1 + (1|Strain) + (1|PairID), smdata, family="gaussian",dispformula = ~SMgroup)
+anova(m00.full, m00.red1)
+
+ggsave("~/hidra/2021/TM/MS/v1/post_size.jpg", ggarrange(p, ncol=1, labels=NULL,legend="top"),device="jpeg",height=6,width=6)
+
+```
+Sex start & fecundity - data handling:
+```{r}
+smdata$Time2gonadogenesis <- as.numeric(as.Date(smdata$Sex_start_date) - as.Date(smdata$Cooling_date))
+
+final_column<-grep("Fate_date",names(smdata)) - 1
+gonads<-smdata[,19:final_column]
+smdata$maxTestes<-NA
+smdata$maxTestes[smdata$Sex=="male"]<-apply(gonads[smdata$Sex=="male",], 1, max, na.rm=T)
+smdata$maxTestes[which(smdata$maxTestes== -Inf)] <- NA
+smdata$maxTestes[which(is.na(smdata$Time2gonadogenesis)&smdata$Sex=="male")]<-0
+
+smdata$sumEggs<-NA
+smdata$sumEggs[smdata$Sex=="female"]<-apply(gonads[smdata$Sex=="female",], 1, sum, na.rm=T)
+smdata$sumEggs[which(smdata$sumEggs == -Inf)] <- NA
+smdata$sumEggs[which(is.na(smdata$Time2gonadogenesis)&smdata$Sex=="female")]<-0
+
+```
+
+Sex start dates - MALES:
+```{r}
+m <- smdata[smdata$Sex=="male",]
+
+hist(smdata$Time2gonadogenesis[smdata$Sex=="male"]) # approximately normal
+leveneTest(smdata$Time2gonadogenesis[smdata$Sex=="male"]~smdata$SMgroup[smdata$Sex=="male"]) # variance constant
+leveneTest(smdata$Time2gonadogenesis[smdata$Sex=="male"]~smdata$Exp_group_2[smdata$Sex=="male"]) # variance not constant; we need to model heteroskedasticity
+
+m1.full.gaussian <- glmmTMB(Time2gonadogenesis~SMgroup*Exp_group_2+(1|Strain)+(1|PairID), data=m[!is.na(m$Time2gonadogenesis),],family="gaussian",dispformula=~Exp_group_2)
+plot(simulateResiduals(m1.full.gaussian, n=1000)) # QQplot shows significant deviation from the expected distribution but the difference is not huge. 
+
+m1.red1 <- glmmTMB(Time2gonadogenesis~SMgroup+Exp_group_2+(1|Strain)+(1|PairID), data=m[!is.na(m$Time2gonadogenesis),],family="gaussian", dispformula = ~Exp_group_2)
+anova(m1.full.gaussian, m1.red1) # significant interaction
+
+p1<-ggplot(m,aes(y=Time2gonadogenesis, x=SMgroup, 
+           group=Exp_group_2, color=Exp_group_2, shape=Exp_group_2))+
+  stat_summary(fun.data = mean_se, geom="errorbar",width=0,position=position_dodge(0.2),size=0.7)+
+  stat_summary(fun=mean,geom="point",position=position_dodge(0.2),size=2)+
+ stat_summary(fun=mean,geom="line",position=position_dodge(0.2),size=0.5) +
+  facet_wrap(~Strain)+
+  xlab("Size group")+
+  ylab("Sexual development time (days)")+
+  labs(color="Food treatment:", shape="Food treatment:")+theme_bw()+
+  scale_color_manual(values=c("grey50","#ffb74d","#d32f2f"))+theme(legend.title.align=1)
+
+p2<-plot(emmeans(m1.full.gaussian, specs=~SMgroup*Exp_group_2),horizontal=F)+ 
+     facet_wrap(~Exp_group_2,scales="free_x")+
+  ylab("Size manipulation group")+
+  xlab("Sexual development time (estimated marginal means)")+theme_bw()+
+  scale_y_discrete(labels=c("reduced","control","enlarged"))+
+  ggtitle("Food treatment:")
+
+ggsave("~/hidra/2021/TM/MS/v1/start_males.jpg", ggarrange(p1, p2, ncol=1, labels="AUTO",legend="top"),device="jpeg",height=10,width=6)
+```
+
+Fecundity - MALES:
+```{r}
+hist(smdata$maxTestes) # Testes number is approximately normally distributed but not far from 0. We consider a Gaussian and a Poisson model
+leveneTest(smdata$maxTestes~smdata$SMgroup) # no difference in variance
+leveneTest(smdata$maxTestes~smdata$Exp_group_2) # significant difference, we need to account for heteroskedasticity
+
+m2.full.gaussian <- glmmTMB(maxTestes~SMgroup * Exp_group_2 + (1|Strain) + (1|PairID), data=m, family="gaussian",dispformula=~Exp_group_2)
+m2.full.poisson <- glmmTMB(maxTestes~SMgroup * Exp_group_2 + (1|Strain) + (1|PairID), data=m, family="poisson",dispformula=~Exp_group_2)
+AICctab(m2.full.gaussian, m2.full.poisson) # the Gaussian model fits the data much better
+
+plot(simulateResiduals(m2.full.gaussian, n=1000)) # despite modelling unequal dispersion, there is still heteroskedasticity left, although it doesn't seem to be very large
+
+m2.red1 <- glmmTMB(maxTestes~SMgroup + Exp_group_2 + (1|Strain) + (1|PairID), data=m, family="gaussian", dispformula=~Exp_group_2)
+anova(m2.full.gaussian, m2.red1) # marginally significant interaction
+
+m2.red2 <- glmmTMB(maxTestes~SMgroup + (1|Strain) + (1|PairID), data=m, family="gaussian", dispformula=~Exp_group_2)
+m2.red3 <- glmmTMB(maxTestes~Exp_group_2 + (1|Strain) + (1|PairID), data=m, family="gaussian", dispformula=~Exp_group_2)
+anova(m2.red1, m2.red2) # food treatment significantly affects testes number
+anova(m2.red1, m2.red3) # size manipulation significantly affects testes number
+
+p1<-ggplot(m,aes(y=maxTestes,x=SMgroup, group=Exp_group_2, 
+           color=Exp_group_2, shape=Exp_group_2))+
+  stat_summary(fun=median,
+                fun.min = function(z) {quantile(z,0.25)},
+                fun.max = function(z) {quantile(z,0.75)}, geom="errorbar",width=0.1,position=position_dodge(0.2),size=0.7)+
+  stat_summary(fun=mean,geom="point",position=position_dodge(0.2),size=2)+
+  stat_summary(fun=mean,geom="line",position=position_dodge(0.2),size=0.5)+
+  facet_wrap(~Strain)+
+  xlab("Size manipulation group")+
+  ylab("No. testes")+
+  labs(color="Food treatment:", shape="Food treatment:")+theme_bw()+
+  scale_color_manual(values=c("grey50","#ffb74d","#d32f2f"))+theme(legend.title.align=1)
+
+p2<-plot(emmeans(m2.full.poisson, specs=~SMgroup*Exp_group_2),horizontal=F,type="response")+ 
+     facet_wrap(~Exp_group_2,scales="free_x")+
+  ylab("Size manipulation group")+
+  xlab("No. testes (estimated marginal means)")+theme_bw()+
+  scale_y_discrete(labels=c("reduced","control","enlarged"))+
+  ggtitle("Food treatment:")
+
+ggsave("~/hidra/2021/TM/MS/v1/testes.jpg", ggarrange(p1, p2, ncol=1, labels="AUTO",legend="top"),device="jpeg",height=10,width=6)
+
+```
+
+Sex start dates - FEMALES:
+```{r}
+f<-smdata[smdata$Sex=="female",]
+
+hist(f$Time2gonadogenesis,breaks=100) # time to gonadogenesis in females looks like a Poisson distribution with an unusual long right tail
+mean(f$Time2gonadogenesis,na.rm=T) # 24.32
+var(f$Time2gonadogenesis,na.rm=T) # 28.44
+# mean and variance similar, no clear overdispersion
+
+leveneTest(f$Time2gonadogenesis~f$SMgroup) # p<0.001
+leveneTest(f$Time2gonadogenesis~f$Exp_group_2) # p<0.001
+# there seems to be unequal variance with respect of size group and food treatment, we need to model that
+
+m3.full.gaussian <- glmmTMB(Time2gonadogenesis~SMgroup * Exp_group_2 + (1|Strain) + (1|PairID), data=f[which(!is.na(f$Time2gonadogenesis)),], family="gaussian", dispformula = ~SMgroup*Exp_group_2)
+m3.full.poisson <- glmmTMB(Time2gonadogenesis~SMgroup * Exp_group_2 + (1|Strain) + (1|PairID), data=f[which(!is.na(f$Time2gonadogenesis)),], family="poisson", dispformula = ~SMgroup*Exp_group_2)
+AICctab(m3.full.gaussian, m3.full.poisson) # a gaussian model seems to fit the data much better; also, it has much better diagnostics
+
+plot(simulateResiduals(m3.full.gaussian, n=1000))
+outl<-outliers(simulateResiduals(m3.full.gaussian, n=1000)) # outliers were identified by DHARMa
+# repeating the analysis without them
+m3.full.gaussian2 <- glmmTMB(Time2gonadogenesis~SMgroup * Exp_group_2 + (1|Strain) + (1|PairID), data=f[which(!is.na(f$Time2gonadogenesis)),][-outl,], family="gaussian", dispformula = ~SMgroup*Exp_group_2)
+
+plot(simulateResiduals(m3.full.gaussian2, n=1000))
+outl2<-outliers(simulateResiduals(m3.full.gaussian2, n=1000)) # outliers were identified by DHARMa
+# repeating the analysis without them
+m3.full.gaussian3 <- glmmTMB(Time2gonadogenesis~SMgroup * Exp_group_2 + (1|Strain) + (1|PairID), data=f[which(!is.na(f$Time2gonadogenesis)),][-outl,][-outl2,], family="gaussian", dispformula = ~SMgroup*Exp_group_2)
+
+plot(simulateResiduals(m3.full.gaussian3, n=1000))
+summary(m3.full.gaussian3)
+# no more outliers detected, but no change detected in the models. We stick with the original version.
+
+m3.red1 <- glmmTMB(Time2gonadogenesis~SMgroup + Exp_group_2 + (1|Strain) + (1|PairID), data=f[which(!is.na(f$Time2gonadogenesis)),], family="gaussian", dispformula = ~SMgroup*Exp_group_2)
+
+anova(m3.full.gaussian, m3.red1) # significant interaction
+
+## check the same on the dataset without outliers
+m3.red1.nooutliers <- glmmTMB(Time2gonadogenesis~SMgroup + Exp_group_2 + (1|Strain) + (1|PairID), data=f[which(!is.na(f$Time2gonadogenesis)),][-outl,][-outl2,], family="gaussian", dispformula = ~SMgroup*Exp_group_2)
+anova(m3.full.gaussian3, m3.red1.nooutliers) # significant interaction
+
+p1<-ggplot(f, aes(y=Time2gonadogenesis, x=SMgroup, 
+           group=Exp_group_2, color=Exp_group_2, shape=Exp_group_2))+
+  stat_summary(fun.data = mean_se, geom="errorbar",width=0,position=position_dodge(0.2),size=0.7)+
+  stat_summary(fun=mean,geom="point",position=position_dodge(0.2),size=2)+
+ stat_summary(fun=mean,geom="line",position=position_dodge(0.2),size=0.5) +
+  facet_wrap(~Strain)+
+  xlab("Size group")+
+  ylab("Sexual development time (days)")+
+  labs(color="Food treatment:", shape="Food treatment:")+theme_bw()+
+  scale_color_manual(values=c("grey50","#ffb74d","#d32f2f"))+theme(legend.title.align=1)
+p2<-plot(emmeans(m3.full.gaussian, specs=~SMgroup*Exp_group_2),horizontal=F)+ 
+     facet_wrap(~Exp_group_2,scales="free_x")+
+  ylab("Size manipulation group")+
+  xlab("Sexual development time (estimated marginal means)")+theme_bw()+
+  scale_y_discrete(labels=c("reduced","control","enlarged"))+
+  ggtitle("Food treatment:")
+
+ggsave("~/hidra/2021/TM/MS/v1/start_females.jpg", ggarrange(p1, p2, ncol=1, labels="AUTO",legend="top"),device="jpeg",height=10,width=6)
+
+```
+
+Fecundity - FEMALES:
+```{r}
+hist(f$sumEggs) # looks like an overdispersed Poisson distribution
+mean(f$sumEggs) # 11.81
+var(f$sumEggs) # 123.43
+# We will need to test a negative binomial model
+leveneTest(f$sumEggs~f$SMgroup)
+leveneTest(f$sumEggs~f$Exp_group_2) # unequal variance with respect of food treatment, we will need to model that
+
+m4.full.poisson <- glmmTMB(sumEggs~SMgroup * Exp_group_2 + (1|Strain) +  (1|PairID), data=f, family="poisson", dispformula = ~Exp_group_2)
+m4.full.nbinom1 <- glmmTMB(sumEggs~SMgroup * Exp_group_2 + (1|Strain) + (1|PairID), data=f, family="nbinom1", dispformula = ~Exp_group_2)
+m4.full.nbinom2 <- glmmTMB(sumEggs~SMgroup * Exp_group_2 + (1|Strain) + (1|PairID), data=f, family="nbinom2", dispformula = ~Exp_group_2)
+AICctab(m4.full.poisson, m4.full.nbinom1, m4.full.nbinom2) # nbinom2 is the best
+
+plot(simulateResiduals(m4.full.nbinom2, n=1000)) # Levene test still significant but there's nothing else we can do
+
+m4.red1 <- glmmTMB(sumEggs~SMgroup + Exp_group_2 + (1|Strain) + (1|PairID), data=f, family="nbinom2", dispformula = ~Exp_group_2)
+
+anova(m4.full.nbinom2, m4.red1) # non-significant interaction
+m4.red2 <- glmmTMB(sumEggs~SMgroup + (1|Strain) + (1|PairID), data=f, family="nbinom2")
+m4.red3 <- glmmTMB(sumEggs~Exp_group_2 + (1|Strain) + (1|PairID), data=f, family="nbinom2", dispformula = ~Exp_group_2)
+anova(m4.red1, m4.red2) # food treatment significantly affects egg number
+anova(m4.red1, m4.red3) # size manipulation significantly affects fecundity
+
+p1<-ggplot(f, aes(y=sumEggs, x=SMgroup, 
+           group=Exp_group_2, color=Exp_group_2, shape=Exp_group_2))+
+  stat_summary(fun.data = mean_se, geom="errorbar",width=0,position=position_dodge(0.2),size=0.7)+
+  stat_summary(fun=mean,geom="point",position=position_dodge(0.2),size=2)+
+ stat_summary(fun=mean,geom="line",position=position_dodge(0.2),size=0.5) +
+  facet_wrap(~Strain)+
+  xlab("Size group")+
+  ylab("No. eggs")+
+  labs(color="Food treatment:", shape="Food treatment:")+theme_bw()+
+  scale_color_manual(values=c("grey50","#ffb74d","#d32f2f"))+theme(legend.title.align=1)
+
+p2<-plot(emmeans(m4.full.nbinom2, specs=~SMgroup*Exp_group_2),horizontal=F,type="response")+ 
+     facet_wrap(~Exp_group_2,scales="free_x")+
+  ylab("Size manipulation group")+
+  xlab("No. eggs (estimated marginal means)")+theme_bw()+
+  scale_y_discrete(labels=c("reduced","control","enlarged"))+
+  ggtitle("Food treatment:")
+
+ggsave("~/hidra/2021/TM/MS/v1/eggs.jpg", ggarrange(p1, p2, ncol=1, labels="AUTO",legend="top"),device="jpeg",height=10,width=6)
+```
+
+Survival
+
+```{r}
+smdata$Survival <- smdata$Fate
+smdata$Survival[smdata$Survival=="dead"] <- 0
+smdata$Survival[smdata$Survival=="necrotic"] <- 0
+smdata$Survival[is.na(smdata$Survival)] <- 0
+smdata$Survival[smdata$Survival=="regenerated"] <- 1
+smdata$Survival[smdata$Survival=="recovered"] <- 1
+smdata$Survival[smdata$Survival=="asex"] <- 1
+
+ggplot(smdata, aes(x=SMgroup, fill=Survival))+geom_bar()+
+  facet_wrap(~Strain)
+
+cols=c("grey50","#ffb74d","#d32f2f")
+
+surv <- smdata %>% group_by(Sex, Strain, Exp_group_2, SMgroup, Survival) %>% summarise(n = n()) %>% mutate(freq = n/sum(n))
+p<-ggplot(surv[surv$Survival==1,],          aes(x=SMgroup,y=freq,group=Exp_group_2,fill=Exp_group_2))+geom_col(position=position_dodge2(preserve="single"),color="black")+facet_wrap(~Sex*Strain)+scale_fill_manual(values=cols)+xlab("Size manipulation group")+ylab("Proportion surviving")+labs(fill="Food treatment:")+theme(legend.title.align=1)
+
+ggsave("~/hidra/2021/TM/MS/v1/survival.jpg",
+    ggarrange(p, ncol=1, legend="top"), 
+    device="jpeg",height=5,width=6)
+
+m5.full <- glmmTMB(as.numeric(Survival)~SMgroup * Exp_group_2 + (1|Strain) + (1|PairID), data=smdata, family="binomial")
+m5.red0 <- glmmTMB(as.numeric(Survival)~SMgroup + Exp_group_2 + (1|Strain) + (1|PairID), data=smdata, family="binomial")
+m5.red1 <- glmmTMB(as.numeric(Survival)~Exp_group_2 + (1|Strain) + (1|PairID), data=smdata, family="binomial")
+m5.red2 <- glmmTMB(as.numeric(Survival)~SMgroup + (1|Strain) + (1|PairID), data=smdata, family="binomial")
+
+anova(m5.full, m5.red0) # p=0.1103 - interaction not significant
+anova(m5.red1, m5.red0) # p<0.001 - size manipulation significant
+anova(m5.red2, m5.red0) # p<0.001 - food availability significant
+
+```
